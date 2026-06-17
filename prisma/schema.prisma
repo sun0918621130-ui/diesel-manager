@@ -1,0 +1,39 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Vehicle {
+  id        Int          @id @default(autoincrement())
+  plateNo   String       @unique
+  type      String       // 例如: 挖掘机, 叉车, 货车
+  createdAt DateTime     @default(now())
+  records   FuelRecord[]
+}
+
+model FuelRecord {
+  id        Int      @id @default(autoincrement())
+  vehicleId Int
+  vehicle   Vehicle  @relation(fields: [vehicleId], references: [id])
+  amount    Float    // 加油量(升)
+  mileage   Float    // 里程数或工作小时数
+  date      DateTime @default(now())
+}
+
+model Inventory {
+  id        Int      @id @default(autoincrement())
+  total     Float    @default(0) // 总库存
+  updatedAt DateTime @updatedAt
+}
+
+model InventoryTransaction {
+  id        Int      @id @default(autoincrement())
+  type      String   // IN (入库) 或 OUT (出库)
+  amount    Float
+  date      DateTime @default(now())
+  note      String?
+}
