@@ -2,9 +2,11 @@ generator client {
   provider = "prisma-client-js"
 }
 
+// 1. 将数据源修改为 PostgreSQL，并配置 Vercel 专用的双链接（连接池 + 直连）
 datasource db {
-  provider = "sqlite"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("POSTGRES_PRISMA_URL")     // 用于日常查询（带连接池，防止 Serverless 连接数爆满）
+  directUrl = env("POSTGRES_URL_NON_POOLING") // 用于数据库结构迁移（直连）
 }
 
 model Vehicle {
