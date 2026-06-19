@@ -20,11 +20,25 @@ interface FuelRecord {
   date: string
 }
 
+interface VehicleStat {
+  id: number
+  plateNo: string
+  type: string
+  totalFuel: number
+  refuelCount: number
+  latestMileage: number
+  mileageDiff: number
+  avgConsumption: string // 计算后的油耗字符串
+}
+
 export default function Dashboard() {
   const [vehicles, setVehicles] = useState<Vehicle[]>([])
   const [records, setRecords] = useState<FuelRecord[]>([])
   const [inventory, setInventory] = useState<number>(0)
   const [loading, setLoading] = useState(true)
+
+  // 车辆编辑模式状态
+  const [editVehicleId, setEditVehicleId] = useState<number | null>(null)
 
   // 表单状态
   const [refuelForm, setRefuelForm] = useState({ vehicleId: "", amount: "", mileage: "" })
@@ -67,7 +81,7 @@ export default function Dashboard() {
     fetchData()
   }, [])
 
-  // 1. 加油登记
+  // 1. 加油登记提交
   const handleRefuelSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!refuelForm.vehicleId || !refuelForm.amount || !refuelForm.mileage) {
@@ -99,27 +113,47 @@ export default function Dashboard() {
     }
   }
 
-  // 2. 新增车辆
+  // 2. 登记/修改 车辆提交
   const handleVehicleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!vehicleForm.plateNo.trim() || !vehicleForm.type) {
       showMsg("error", "车牌号不能为空")
       return
     }
+
+    const formattedPlateNo = vehicleForm.plateNo.toUpperCase().trim()
+
     try {
-      const res = await fetch("/api/vehicles", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          plateNo: vehicleForm.plateNo.toUpperCase().trim(),
-          type: vehicleForm.type
+      if (editVehicleId !== null) {
+        // 修改模式 (PUT)
+        const res = await fetch("/api/vehicles", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            id: editVehicleId,
+            plateNo: formattedPlateNo,
+            type: vehicleForm.type
+          })
         })
-      })
-      if (!res.ok) {
-        const errorData = await res.json()
-        throw new Error(errorData.error || "新增车辆失败")
+        if (!res.ok) throw new Error("修改车辆信息失败")
+        showMsg("success", "车辆档案更新成功")
+        setEditVehicleId(null)
+      } else {
+        // 新增模式 (POST)
+        const res = await fetch("/api/vehicles", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            plateNo: formattedPlateNo,
+            type: vehicleForm.type
+          })
+        })
+        if (!res.ok) {
+          const errorData = await res.json()
+          throw new Error(errorData.error || "新增车辆失败")
+        }
+        showMsg("success", "新车辆登记成功")
       }
-      showMsg("success", "新车辆登记成功")
       setVehicleForm({ plateNo: "", type: "叉车" })
       fetchData()
     } catch (err: any) {
@@ -127,7 +161,54 @@ export default function Dashboard() {
     }
   }
 
-  // 3. 登记入库
+  // 激活修改车辆模式
+  const startEditVehicle = (vehicle: Vehicle) => {
+    setEditVehicleId(vehicle.id)
+    setVehicleForm({
+      plateNo: vehicle.plateNo,
+      type: vehicle.type
+    })
+    window.scrollTo({ top: 300, behavior: 'smooth' }) // 平滑滚动到编辑区
+  }
+
+  // 取消修改车辆模式
+  const cancelEditVehicle = () => {
+    setEditVehicleId(null)
+    setVehicleForm({ plateNo: "", type: "叉车" })
+  }
+
+  // 3. 删除车辆登记 (带事务防外键报错安全机制)
+  const handleDeleteVehicle = async (vehicle: Vehicle) => {
+    const isConfirmed = window.confirm(
+      `⚠️ 警告！确定要彻底删除车辆【${vehicle.plateNo}】吗？\n\n这将会一并永久清理该车辆关联的历史加油记录，且不可恢复！`
+    )
+    if (!isConfirmed) return
+
+    try {
+      const res = await fetch(`/api/vehicles?id=${vehicle.id}`, {
+        method: "DELETE"
+      })
+      if (!res.ok) throw new Error("删除失败")
+      
+      showMsg("success", `车辆 ${vehicle.plateNo} 及其关联的历史数据已被彻底清理`)
+      
+      // 如果被删除的车辆当前刚好被选中在加油下拉框中，则重置它
+      if (refuelForm.vehicleId === vehicle.id.toString()) {
+        setRefuelForm({ ...refuelForm, vehicleId: "" })
+      }
+      
+      // 如果正在编辑这辆车，也退出编辑状态
+      if (editVehicleId === vehicle.id) {
+        cancelEditVehicle()
+      }
+
+      fetchData()
+    } catch (err) {
+      showMsg("error", "删除失败，请刷新网页重试")
+    }
+  }
+
+  // 4. 登记采购补油入库
   const handleStockSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!stockForm.amount || parseFloat(stockForm.amount) <= 0) {
@@ -152,6 +233,67 @@ export default function Dashboard() {
       showMsg("error", "入库登记出错，请确认网络并重试")
     }
   }
+
+  // 5. 核心：计算每台车辆的年度累计油耗与平均每百公里/每小时能耗
+  const calculateVehicleStats = (): VehicleStat[] => {
+    return vehicles.map(v => {
+      // 筛选出该车辆名下的所有加油记录
+      const vRecords = records.filter(r => r.vehicleId === v.id)
+      
+      // 计算累计加油量 (升)
+      const totalFuel = vRecords.reduce((sum, r) => sum + r.amount, 0)
+      
+      // 加油次数
+      const refuelCount = vRecords.length
+
+      // 提取所有有效的里程/工时记录
+      const mileages = vRecords.map(r => r.mileage).filter(val => val !== undefined && val !== null)
+      
+      let latestMileage = 0
+      let mileageDiff = 0
+      let avgConsumption = "暂无计算数据"
+
+      if (mileages.length > 0) {
+        latestMileage = Math.max(...mileages)
+      }
+
+      if (mileages.length >= 2) {
+        // 里程差值 = 最大里程 - 最小里程 (代表累积跑了多少公里/工时)
+        const minMileage = Math.min(...mileages)
+        const maxMileage = Math.max(...mileages)
+        mileageDiff = maxMileage - minMileage
+
+        if (mileageDiff > 0) {
+          if (v.type === "叉车" || v.type === "挖掘机") {
+            // 工时类车辆：核算 平均每工时消耗多少升 (L/小时)
+            const efficiency = totalFuel / mileageDiff
+            avgConsumption = `${efficiency.toFixed(2)} 升 / 小时`
+          } else {
+            // 路面运输车辆：核算 典型百公里油耗 (L/100km)
+            const efficiency = (totalFuel / mileageDiff) * 100
+            avgConsumption = `${efficiency.toFixed(2)} 升 / 百公里`
+          }
+        } else {
+          avgConsumption = "里程数无变化"
+        }
+      } else if (mileages.length === 1) {
+        avgConsumption = "需要至少2次加油记录计算"
+      }
+
+      return {
+        id: v.id,
+        plateNo: v.plateNo,
+        type: v.type,
+        totalFuel,
+        refuelCount,
+        latestMileage,
+        mileageDiff,
+        avgConsumption
+      }
+    })
+  }
+
+  const vehicleStats = calculateVehicleStats()
 
   return (
     <div className="min-h-screen bg-gray-50 pb-12">
@@ -243,7 +385,7 @@ export default function Dashboard() {
               <h3 className="text-3xl font-bold mt-1 text-gray-800">
                 {records.length} <span className="text-lg font-normal text-gray-500">次</span>
               </h3>
-              <p className="text-xs text-gray-400 mt-2">系统底层自动联动计算</p>
+              <p className="text-xs text-gray-400 mt-2">系统底层自动建档核算</p>
             </div>
             <div className="bg-emerald-50 p-4 rounded-full text-emerald-600">
               <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -359,13 +501,22 @@ export default function Dashboard() {
           {/* 右侧栏 —— 车辆登记及档案（占 5 格） */}
           <div className="lg:col-span-5 space-y-8">
             
-            {/* 表单 3：新增车辆 */}
-            <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
-              <div className="flex items-center gap-2 pb-4 mb-4 border-b border-gray-100 text-gray-800">
-                <svg className="w-5 h-5 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z" />
-                </svg>
-                <h2 className="font-bold text-lg">新增车辆档案建档</h2>
+            {/* 表单 3：新增/修改车辆 */}
+            <div className={`p-6 rounded-xl shadow-sm border transition-all ${
+              editVehicleId !== null ? "bg-amber-50/40 border-amber-200" : "bg-white border-gray-100"
+            }`}>
+              <div className="flex items-center justify-between pb-4 mb-4 border-b border-gray-100 text-gray-800">
+                <div className="flex items-center gap-2">
+                  <svg className={`w-5 h-5 ${editVehicleId !== null ? "text-amber-600" : "text-blue-600"}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z" />
+                  </svg>
+                  <h2 className="font-bold text-lg">
+                    {editVehicleId !== null ? "修改车辆档案信息" : "新增车辆档案建档"}
+                  </h2>
+                </div>
+                {editVehicleId !== null && (
+                  <span className="px-2 py-0.5 bg-amber-100 text-amber-800 text-xs font-semibold rounded">修改模式</span>
+                )}
               </div>
               <form onSubmit={handleVehicleSubmit} className="space-y-4">
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -393,32 +544,123 @@ export default function Dashboard() {
                     </select>
                   </div>
                 </div>
-                <button 
-                  type="submit"
-                  className="w-full bg-amber-600 hover:bg-amber-700 text-white py-3 rounded-lg font-semibold shadow-sm transition-all flex items-center justify-center gap-1.5"
-                >
-                  登记该车辆
-                </button>
+                <div className="flex gap-2">
+                  <button 
+                    type="submit"
+                    className={`flex-1 text-white py-2.5 rounded-lg font-semibold shadow-sm transition-all flex items-center justify-center gap-1.5 ${
+                      editVehicleId !== null ? "bg-amber-600 hover:bg-amber-700" : "bg-blue-600 hover:bg-blue-750"
+                    }`}
+                  >
+                    {editVehicleId !== null ? "确认保存修改" : "登记该车辆"}
+                  </button>
+                  {editVehicleId !== null && (
+                    <button 
+                      type="button"
+                      onClick={cancelEditVehicle}
+                      className="px-4 py-2.5 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-lg font-semibold transition-all"
+                    >
+                      取消
+                    </button>
+                  )}
+                </div>
               </form>
             </div>
 
-            {/* 车辆列表明细 */}
+            {/* 车辆列表明细 (带修改、删除功能) */}
             <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
-              <h2 className="font-bold text-gray-800 pb-3 mb-3 border-b border-gray-100">已登记车辆明细 ({vehicles.length})</h2>
-              <div className="max-h-56 overflow-y-auto space-y-2 pr-1">
+              <h2 className="font-bold text-gray-800 pb-3 mb-3 border-b border-gray-100">已登记车辆管理列表 ({vehicles.length})</h2>
+              <div className="max-h-60 overflow-y-auto space-y-2 pr-1">
                 {vehicles.length === 0 ? (
                   <p className="text-sm text-gray-400 text-center py-6">系统暂未录入任何车辆</p>
                 ) : (
                   vehicles.map(v => (
-                    <div key={v.id} className="flex justify-between items-center p-3 bg-gray-50 rounded-lg border border-gray-100 text-sm hover:bg-gray-100 transition-colors">
-                      <span className="font-bold text-gray-700 tracking-wide">{v.plateNo}</span>
-                      <span className="px-2.5 py-1 bg-white border border-gray-200 text-gray-600 text-xs font-semibold rounded-md shadow-sm">{v.type}</span>
+                    <div key={v.id} className="flex justify-between items-center p-3 bg-gray-50 rounded-lg border border-gray-100 hover:bg-gray-100 transition-colors">
+                      <div className="flex flex-col gap-0.5">
+                        <span className="font-bold text-gray-800 tracking-wide">{v.plateNo}</span>
+                        <span className="text-xs text-gray-400">分类：{v.type}</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        {/* 修改按钮 */}
+                        <button
+                          onClick={() => startEditVehicle(v)}
+                          title="修改车辆档案"
+                          className="p-1.5 bg-white border border-gray-200 hover:border-amber-400 hover:text-amber-600 text-gray-500 rounded shadow-sm transition-all"
+                        >
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                          </svg>
+                        </button>
+                        {/* 删除按钮 */}
+                        <button
+                          onClick={() => handleDeleteVehicle(v)}
+                          title="报废并清除车辆加油记录"
+                          className="p-1.5 bg-white border border-gray-200 hover:border-red-400 hover:text-red-600 text-gray-500 rounded shadow-sm transition-all"
+                        >
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                          </svg>
+                        </button>
+                      </div>
                     </div>
                   ))
                 )}
               </div>
             </div>
 
+          </div>
+        </div>
+
+        {/* 💥 新模块：车辆能耗年度/累计统计分析排行榜 */}
+        <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100 mt-8">
+          <div className="flex justify-between items-center pb-4 mb-4 border-b border-gray-100">
+            <div className="flex items-center gap-2 text-gray-800">
+              <svg className="w-5 h-5 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" />
+              </svg>
+              <div>
+                <h2 className="font-bold text-lg">车辆累计用能与能耗核算排行榜</h2>
+                <p className="text-xs text-gray-400 mt-0.5">工时类车辆展现【升/小时】，运输类车辆展现百公里油耗【升/百公里】</p>
+              </div>
+            </div>
+            <span className="text-xs font-semibold px-2 py-1 bg-amber-50 text-amber-700 border border-amber-100 rounded">智能核算引擎 v2.0</span>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm border-collapse">
+              <thead>
+                <tr className="bg-gray-50 text-gray-500 font-semibold border-b border-gray-100">
+                  <th className="py-3 px-4">车牌号</th>
+                  <th className="py-3 px-4">车辆类型</th>
+                  <th className="py-3 px-4">累计加油总量</th>
+                  <th className="py-3 px-4">加油频次</th>
+                  <th className="py-3 px-4">最后登记里程/工时</th>
+                  <th className="py-3 px-4 text-amber-700">平均核算能耗</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-50 text-gray-700">
+                {vehicleStats.length === 0 ? (
+                  <tr>
+                    <td colSpan={6} className="py-8 text-center text-gray-400">暂无车辆数据，请先录入车辆档案</td>
+                  </tr>
+                ) : (
+                  vehicleStats.map(stat => (
+                    <tr key={stat.id} className="hover:bg-gray-50/50 transition-colors">
+                      <td className="py-3.5 px-4 font-bold text-gray-800">{stat.plateNo}</td>
+                      <td className="py-3.5 px-4">
+                        <span className="px-2 py-0.5 bg-gray-100 border border-gray-200 text-gray-600 text-xs rounded">
+                          {stat.type}
+                        </span>
+                      </td>
+                      <td className="py-3.5 px-4 font-semibold text-gray-900">{stat.totalFuel.toFixed(2)} 升</td>
+                      <td className="py-3.5 px-4 text-gray-500">{stat.refuelCount} 次</td>
+                      <td className="py-3.5 px-4 text-gray-600">{stat.latestMileage}</td>
+                      <td className="py-3.5 px-4 font-bold text-amber-700">
+                        {stat.avgConsumption}
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
           </div>
         </div>
 
@@ -431,7 +673,7 @@ export default function Dashboard() {
               </svg>
               <h2 className="font-bold text-lg">最近加油记录交易流水</h2>
             </div>
-            <span className="text-xs text-gray-400">实时反映库存扣除和加油流向</span>
+            <span className="text-xs text-gray-400">系统实时记录</span>
           </div>
           <div className="overflow-x-auto">
             <table className="w-full text-left text-sm border-collapse">
@@ -441,13 +683,13 @@ export default function Dashboard() {
                   <th className="py-3 px-4">加油车牌</th>
                   <th className="py-3 px-4">车型</th>
                   <th className="py-3 px-4">加油量</th>
-                  <th className="py-3 px-4">仪表盘里程 / 累计工时</th>
+                  <th className="py-3 px-4">本次仪表盘里程/工时</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-50 text-gray-700">
                 {records.length === 0 ? (
                   <tr>
-                    <td colSpan={5} className="py-10 text-center text-gray-400 font-medium">暂无加油记录数据，请进行加油登记</td>
+                    <td colSpan={5} className="py-10 text-center text-gray-400 font-medium">暂无加油记录数据，请在上方进行加油登记</td>
                   </tr>
                 ) : (
                   records.map(r => (
